@@ -1254,6 +1254,7 @@ fn make_effect(f: &FxSpec) -> Effect {
             if *inner { Effect::InnerGlow(g) } else { Effect::OuterGlow(g) }
         }
         FxSpec::Stroke { color, gradient, position, size, blend, opacity } => Effect::Stroke(StrokeFx {
+            overprint: false,
             common: FxCommon::new(*blend, *opacity),
             size: *size,
             position: [StrokePosition::Outside, StrokePosition::Inside, StrokePosition::Center][usize::from(*position) % 3],
@@ -1276,6 +1277,7 @@ fn make_effect(f: &FxSpec) -> Effect {
             invert: *invert,
         }),
         FxSpec::Bevel { style, size, up, highlight, shadow } => Effect::BevelEmboss(Bevel {
+            gloss_anti_alias: false,
             enabled: true,
             style: [BevelStyle::OuterBevel, BevelStyle::InnerBevel, BevelStyle::Emboss, BevelStyle::PillowEmboss, BevelStyle::StrokeEmboss]
                 [usize::from(*style) % 5],
@@ -1418,6 +1420,7 @@ fn overlays_and_strokes_paint_exact_inks() {
     l.effects.enabled = true;
     l.effects.items.push(Effect::ColorOverlay { common: FxCommon::new(BlendMode::Normal, 1.0), color: ink_color([0.2, 0.4, 0.6, 0.1]) });
     l.effects.items.push(Effect::Stroke(StrokeFx {
+        overprint: false,
         common: FxCommon::new(BlendMode::Normal, 1.0),
         size: 1.0,
         position: StrokePosition::Outside,
