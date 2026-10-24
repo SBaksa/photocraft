@@ -18,7 +18,10 @@
 //!
 //! Buffers hold straight-alpha `[C, M, Y, K, A]` in 0..1 ink (0 = no ink).
 
+use std::sync::Arc;
+
 use photocraft_color::blend::BlendMode;
+use photocraft_color::convert::CmykSpace;
 use photocraft_color::{ColorMode, SampleType};
 use photocraft_doc::adjust::ToneSpace;
 use photocraft_doc::{Adjustment, Document, Knockout, Layer, LayerContent};
@@ -399,10 +402,22 @@ fn adjust_inks(adj: &Adjustment, buf: &mut CmykBuffer, depth: SampleType) {
 /// mask; coverage is unchanged (the compositor's adjustment mix).
 fn mix_adjusted(l: &Layer, base: &mut CmykBuffer, adjusted: &CmykBuffer, cx: &Ctx) {
     let opacity = l.opacity * l.fill_opacity;
-    let mv = mask_vals(l, base.rect, cx);
+    let rect = base.rect;
+    let w = (rect.width() as usize).max(1);
+    let mv = mask_vals(l, rect, cx);
     for (i, (p, a)) in base.px.iter_mut().zip(&adjusted.px).enumerate() {
         let k = opacity * mask_at(&mv, i);
         if k <= 0.0 {
+            continue;
+        }
+        if l.blend == BlendMode::Dissolve {
+            // As on the RGB compositor (#3050): opacity and mask are the chance a pixel takes the
+            // adjustment fully, by the same noise.
+            let x = rect.x0.saturating_add((i % w) as i32);
+            let y = rect.y0.saturating_add((i / w) as i32);
+            if super::dissolve_noise(x, y) < k {
+                *p = [a[0], a[1], a[2], a[3], p[4]];
+            }
             continue;
         }
         let bl = blend_ink(l.blend, [p[0], p[1], p[2], p[3]], [a[0], a[1], a[2], a[3]]);
@@ -413,10 +428,10 @@ fn mix_adjusted(l: &Layer, base: &mut CmykBuffer, adjusted: &CmykBuffer, cx: &Ct
 }
 
 /// Rounds to the document's levels after an adjustment layer, as the compositor does (on the
-/// channel brightness the document stores, and coverage).
-fn quantize_inks(buf: &mut CmykBuffer, q: f32) {
+/// channel brightness the document stores, and coverage). Also used by [`super::native`].
+pub(crate) fn quantize_inks(px: &mut [Cmyka], q: f32) {
     let round = |v: f32| (v * q + 0.5).floor() / q;
-    for p in &mut buf.px {
+    for p in px {
         for v in p.iter_mut().take(4) {
             // Whole levels of ink: exactly the stored values, rounding ties as on brightness.
             *v = (q - ((1.0 - *v) * q + 0.5).floor()) / q;
@@ -438,9 +453,21 @@ fn composite_clipped(clipped: &[Layer], base: &mut CmykBuffer, cx: &Ctx) {
         let content = layer_content(c, base.rect, cx);
         let opacity = c.opacity * c.fill_opacity;
         let gamma = super::text_gamma(c);
-        for (p, s) in base.px.iter_mut().zip(&content.px) {
+        let rect = base.rect;
+        let w = (rect.width() as usize).max(1);
+        for (i, (p, s)) in base.px.iter_mut().zip(&content.px).enumerate() {
             let alpha = p[4];
             if alpha <= 0.0 {
+                continue;
+            }
+            if c.blend == BlendMode::Dissolve {
+                // As on the RGB compositor (#3052): the base keeps its alpha and each pixel takes
+                // the clipped layer fully or not at all, by the same noise.
+                let x = rect.x0.saturating_add((i % w) as i32);
+                let y = rect.y0.saturating_add((i / w) as i32);
+                if super::dissolve_noise(x, y) < s[4] * opacity {
+                    *p = [s[0], s[1], s[2], s[3], alpha];
+                }
                 continue;
             }
             let r = composite_ink(c.blend, [p[0], p[1], p[2], p[3], 1.0], *s, opacity, gamma);
@@ -474,7 +501,7 @@ fn composite_stack(layers: &[Layer], backdrop: &mut CmykBuffer, cx: &Ctx) {
         if base.visible {
             composite_layer(base, clipped, backdrop, cx);
             if let (LayerContent::Adjustment(_), Some(q)) = (&base.content, super::adjustment_quantum(cx.depth)) {
-                quantize_inks(backdrop, q);
+                quantize_inks(&mut backdrop.px, q);
             }
         }
     }
@@ -545,12 +572,15 @@ fn blend_into_fill(backdrop: &mut CmykBuffer, src: &CmykBuffer, l: &Layer, gamma
     }
 }
 
-fn render_tile(doc: &Document, rect: Rect, cx: &Ctx) -> CmykBuffer {
+/// One tile on ink values. `space` is the document's CMYK profile ([`super::cmyk_space`]): a
+/// colour given in RGB or Lab (a fill, say) becomes ink through it, and tiles run on worker
+/// threads, which don't inherit the caller's scope.
+fn render_tile(doc: &Document, rect: Rect, cx: &Ctx, space: Option<&Arc<CmykSpace>>) -> CmykBuffer {
     let mut b = CmykBuffer::transparent(rect);
     // Blends stay clipped to 0..1 whatever the depth: unclipped (HDR) blending would make
     // brightness above 1, i.e. negative ink. Set explicitly, since a tile can run on a thread
     // that is in the middle of an RGB composite of a 32-bit document.
-    super::in_blend_space(false, false, || composite_stack(&doc.layers, &mut b, cx));
+    photocraft_color::convert::with_cmyk_space(space, || super::in_blend_space(false, false, || composite_stack(&doc.layers, &mut b, cx)));
     b
 }
 
@@ -601,7 +631,8 @@ pub fn render_cmyk_tiled(doc: &Document, rect: Rect, tile: i32) -> Option<CmykBu
     if supports(doc) {
         let patterns = pattern::PreparedPatterns::new(&doc.patterns, pattern::PREPARED_PATTERN_BYTES).in_mode(doc.pixel_format().mode);
         let cx = Ctx::for_doc(doc, &patterns);
-        return Some(render_with(rect, tile, |t| render_tile(doc, t, &cx)));
+        let space = super::cmyk_space(doc);
+        return Some(render_with(rect, tile, |t| render_tile(doc, t, &cx, space.as_ref())));
     }
     if !split::supports(doc) {
         return None;
@@ -667,11 +698,12 @@ pub fn render_cmyk_bands<E>(doc: &Document, rect: Rect, band_rows: i32, mut sink
     }
     let patterns = pattern::PreparedPatterns::new(&doc.patterns, pattern::PREPARED_PATTERN_BYTES).in_mode(doc.pixel_format().mode);
     let cx = Ctx::for_doc(doc, &patterns);
+    let space = super::cmyk_space(doc);
     let rows = super::band_rows_for(rect.width(), band_rows);
     let mut y = rect.y0;
     while y < rect.y1 {
         let y1 = y.saturating_add(rows).min(rect.y1);
-        if let Err(e) = sink(render_with(Rect::new(rect.x0, y, rect.x1, y1), RENDER_TILE, |t| render_tile(doc, t, &cx))) {
+        if let Err(e) = sink(render_with(Rect::new(rect.x0, y, rect.x1, y1), RENDER_TILE, |t| render_tile(doc, t, &cx, space.as_ref()))) {
             return Some(Err(e));
         }
         y = y1;

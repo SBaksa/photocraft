@@ -219,6 +219,10 @@ fn ref_adjusted(l: &Layer, adj: &Adjustment, clipped: &[Layer], p: Cmyka, x: i32
         a = ref_clip(clipped, a, x, y);
     }
     let k = l.opacity * l.fill_opacity * ref_mask(l, x, y);
+    if l.blend == BlendMode::Dissolve {
+        // Opacity and mask are the chance the pixel takes the adjustment fully.
+        return if k > 0.0 && crate::dissolve_noise(x, y) < k { [a[0], a[1], a[2], a[3], p[4]] } else { p };
+    }
     let mut o = p;
     for c in 0..4 {
         o[c] = p[c] + (ref_blend(l.blend, p[c], a[c]) - p[c]) * k;
@@ -233,7 +237,7 @@ fn ref_clip(clipped: &[Layer], mut content: Cmyka, x: i32, y: i32) -> Cmyka {
             content = ref_adjusted(c, adj, &[], content, x, y);
         } else if content[4] > 0.0 {
             let a = content[4];
-            let r = over_layer(c, [content[0], content[1], content[2], content[3], 1.0], ref_own(c, x, y), c.opacity * c.fill_opacity, None);
+            let r = over_layer(c, [content[0], content[1], content[2], content[3], 1.0], ref_own(c, x, y), c.opacity * c.fill_opacity, Some((x, y)));
             content = [r[0], r[1], r[2], r[3], a];
         }
     }
@@ -1254,17 +1258,18 @@ fn make_effect(f: &FxSpec) -> Effect {
             if *inner { Effect::InnerGlow(g) } else { Effect::OuterGlow(g) }
         }
         FxSpec::Stroke { color, gradient, position, size, blend, opacity } => Effect::Stroke(StrokeFx {
-            overprint: false,
             common: FxCommon::new(*blend, *opacity),
             size: *size,
             position: [StrokePosition::Outside, StrokePosition::Inside, StrokePosition::Center][usize::from(*position) % 3],
             paint: paint(color, gradient),
+            overprint: false,
         }),
         FxSpec::Overlay { color, blend, opacity } => Effect::ColorOverlay { common: FxCommon::new(*blend, *opacity), color: ink_color(*color) },
         FxSpec::GradientOverlay { from, to, blend, opacity } => Effect::GradientOverlay {
             common: FxCommon::new(*blend, *opacity),
             gradient: Gradient { stops: vec![(0.0, ink_color(*from)), (1.0, ink_color(*to))], ..Default::default() },
             dither: false,
+            interpolation: None,
         },
         FxSpec::Satin { color, blend, opacity, invert } => Effect::Satin(Satin {
             common: FxCommon::new(*blend, *opacity),
@@ -1277,7 +1282,6 @@ fn make_effect(f: &FxSpec) -> Effect {
             invert: *invert,
         }),
         FxSpec::Bevel { style, size, up, highlight, shadow } => Effect::BevelEmboss(Bevel {
-            gloss_anti_alias: false,
             enabled: true,
             style: [BevelStyle::OuterBevel, BevelStyle::InnerBevel, BevelStyle::Emboss, BevelStyle::PillowEmboss, BevelStyle::StrokeEmboss]
                 [usize::from(*style) % 5],
@@ -1290,6 +1294,7 @@ fn make_effect(f: &FxSpec) -> Effect {
             altitude: 30.0,
             use_global_light: false,
             gloss_contour: Contour::Linear,
+            gloss_anti_alias: false,
             highlight: FxCommon::new(BlendMode::Screen, 0.75),
             highlight_color: ink_color(*highlight),
             shadow: FxCommon::new(BlendMode::Multiply, 0.75),
@@ -1420,11 +1425,11 @@ fn overlays_and_strokes_paint_exact_inks() {
     l.effects.enabled = true;
     l.effects.items.push(Effect::ColorOverlay { common: FxCommon::new(BlendMode::Normal, 1.0), color: ink_color([0.2, 0.4, 0.6, 0.1]) });
     l.effects.items.push(Effect::Stroke(StrokeFx {
-        overprint: false,
         common: FxCommon::new(BlendMode::Normal, 1.0),
         size: 1.0,
         position: StrokePosition::Outside,
         paint: FxPaint::Color(ink_color([0.0, 1.0, 0.0, 0.0])),
+        overprint: false,
     }));
     d.layers.push(l);
     let got = render_cmyk(&d, d.bounds()).unwrap_or_else(|| panic!("supported"));
@@ -1653,4 +1658,143 @@ fn flattening_keeps_exact_inks() {
     assert_eq!(flat.pixel(2, 0), vec![0.0, 0.0, 0.0, q(0.4)], "40% K over paper");
     let stamp = crate::flatten_to_surface(&d, CMYKA8, None);
     assert_eq!(stamp.pixel(2, 0), vec![0.0, 0.0, 0.0, 1.0, q(0.4)]);
+}
+
+/// A colour given in RGB becomes ink through the document's own CMYK profile, not the built-in
+/// coated one, on both ink paths: a solid fill on the exact path (its tiles render on worker
+/// threads) and a Color Overlay on the split path (its stand-ins).
+#[test]
+fn rgb_colours_become_ink_through_the_document_profile() {
+    let profile = photocraft_cms::synth::cmyk_profile(&photocraft_cms::synth::CmykParams {
+        description: "Test Uncoated".into(),
+        tvi: [0.26, 0.26, 0.26, 0.3],
+        grid_a2b: 5,
+        grid_b2a: 9,
+        ..Default::default()
+    });
+    let bytes = profile.to_bytes();
+    let space = photocraft_color::convert::CmykSpace::for_profile(Some(&bytes));
+    assert!(space.is_some(), "a profile other than the built-in one");
+    let rgb = photocraft_color::Color { mode: ColorMode::Rgb, c: [0.2, 0.5, 0.8, 0.0], alpha: 1.0 };
+    let want = photocraft_color::convert::with_cmyk_space(space.as_ref(), || rgb.in_mode(ColorMode::Cmyk).c);
+    let builtin = rgb.in_mode(ColorMode::Cmyk).c;
+    assert!((0..4).any(|i| (want[i] - builtin[i]).abs() > 0.02), "the profiles differ: {want:?} {builtin:?}");
+    let check = |d: &Document, what: &str| {
+        let got = render_cmyk(d, d.bounds()).unwrap_or_else(|| panic!("supported"));
+        for p in &got.px {
+            assert!((0..4).all(|i| (p[i] - want[i]).abs() <= 1.0 / 255.0) && p[4] == 1.0, "{what}: {p:?}, want {want:?} (built-in {builtin:?})");
+        }
+    };
+
+    let mut exact = doc(8, 4);
+    exact.icc_profile = Some(bytes.clone());
+    exact.layers.push(Layer::new("fill", LayerContent::Fill(photocraft_doc::Fill::Solid(rgb))));
+    assert!(supports(&exact));
+    check(&exact, "solid fill");
+
+    let mut overlay = doc(8, 4);
+    overlay.icc_profile = Some(bytes);
+    let mut l = layer(&[(Rect::new(0, 0, 8, 4), [0.0, 0.0, 0.0, 1.0, 1.0])]);
+    l.effects.enabled = true;
+    l.effects.items.push(Effect::ColorOverlay { common: FxCommon::new(BlendMode::Normal, 1.0), color: rgb });
+    overlay.layers.push(l);
+    assert!(!supports(&overlay) && split::supports(&overlay));
+    check(&overlay, "colour overlay");
+}
+
+/// The split route and the exact path give the same inks for `s`, alpha included.
+fn assert_split_matches_exact(s: &Spec) {
+    let mut d = doc(s.w as u32, s.h as u32);
+    d.layers = s.layers.iter().map(build).collect();
+    assert!(supports(&d) && split::supports(&d));
+    let via = split_render(&d);
+    let exact = render_cmyk(&d, via.rect).unwrap_or_else(|| panic!("supported"));
+    for (i, (g, w)) in via.px.iter().zip(&exact.px).enumerate() {
+        assert!((0..5).all(|c| (g[c] - w[c]).abs() <= 1e-5), "pixel {i}: {g:?} vs {w:?}");
+    }
+}
+
+fn raster_spec(blend: BlendMode, fill: (Rect, Cmyka), opacity: f32, clipped: bool) -> LayerSpec {
+    LayerSpec::Pixels { kind: Kind::Raster, blend, fills: vec![fill], opacity, fill: 1.0, clipped, visible: true, mask: None }
+}
+
+fn group_spec(children: Vec<LayerSpec>, pass_through: bool) -> LayerSpec {
+    LayerSpec::Group { children, pass_through, blend: BlendMode::Normal, opacity: 1.0, fill: 1.0, mask: None }
+}
+
+/// A clipped Dissolve layer shows each pixel fully or not at all on the exact path too, as on the
+/// RGB compositor (#9033; it used to mix like Normal: K 0.81 where the noise hides the layer).
+#[test]
+fn a_clipped_dissolve_layer_dissolves_on_the_exact_path() {
+    let s = Spec {
+        w: 4,
+        h: 5,
+        layers: vec![group_spec(
+            vec![
+                raster_spec(BlendMode::Normal, (Rect::new(0, 0, 2, 1), [0.0, 0.0, 0.0, 1.0, 1.0]), 1.0, false),
+                raster_spec(BlendMode::Dissolve, (Rect::new(0, 0, 1, 1), [0.0, 0.0, 0.0, 0.0, 1.0]), 0.189_737_02, true),
+            ],
+            false,
+        )],
+    };
+    assert_split_matches_exact(&s);
+}
+
+/// A Dissolve adjustment layer takes each pixel fully or not at all on the exact path too (#9033;
+/// it used to mix by opacity: cyan 0.267 where the noise picks the adjusted 0.298).
+#[test]
+fn a_dissolve_adjustment_dissolves_on_the_exact_path() {
+    let levels = AdjSpec::Levels { channel: 0, levels: [0.0, 0.6, 0.3, 0.0, 0.7] };
+    let adjust = LayerSpec::Pixels {
+        kind: Kind::Adjust(levels),
+        blend: BlendMode::Dissolve,
+        fills: vec![(Rect::new(0, 0, 1, 1), [0.0; 5])],
+        opacity: 0.897_210_9,
+        fill: 1.0,
+        clipped: false,
+        visible: true,
+        mask: None,
+    };
+    let s = Spec {
+        w: 3,
+        h: 2,
+        layers: vec![
+            group_spec(vec![raster_spec(BlendMode::Normal, (Rect::new(0, 0, 1, 1), [0.0, 0.0, 0.0, 0.0, 1.0]), 1.0, false)], false),
+            group_spec(vec![adjust], true),
+        ],
+    };
+    assert_split_matches_exact(&s);
+}
+
+/// After an adjustment layer, the display route ([`crate::native`]) rounds to the document's
+/// levels like the export path and the RGB compositor, at any opacity (#9033: in a pass-through
+/// group its coverage stayed at 41.32% where the others store 105/255).
+#[test]
+fn every_cmyk_route_rounds_after_an_adjustment_layer() {
+    for opacity in [0.0, 0.5] {
+        let adjust = LayerSpec::Pixels {
+            kind: Kind::Adjust(AdjSpec::Invert),
+            blend: BlendMode::Normal,
+            fills: vec![(Rect::new(0, 0, 1, 1), [0.0; 5])],
+            opacity,
+            fill: 1.0,
+            clipped: false,
+            visible: true,
+            mask: None,
+        };
+        let s = Spec {
+            w: 8,
+            h: 5,
+            layers: vec![group_spec(vec![raster_spec(BlendMode::Normal, (Rect::new(0, 0, 1, 1), [0.0, 0.0, 0.0, 0.0, 1.0]), 1.0, false), adjust], true)],
+        };
+        let mut d = doc(s.w as u32, s.h as u32);
+        d.layers = s.layers.iter().map(build).collect();
+        if let LayerContent::Group(g) = &mut d.layers[0].content {
+            g.children[0].fill_opacity = 0.413_248_66;
+        }
+        let rect = Rect::new(0, 0, 1, 1);
+        let display = crate::render(&d, rect).px[0][3];
+        let export = render_cmyk(&d, rect).unwrap_or_else(|| panic!("supported")).px[0][4];
+        assert_eq!((display, export), (105.0 / 255.0, 105.0 / 255.0), "opacity {opacity}");
+    }
 }
